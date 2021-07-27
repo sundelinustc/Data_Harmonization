@@ -1,0 +1,1145 @@
+---
+title: "SDL_Harmonization"
+author: "Delin Sun"
+date: "4/29/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setting up Packages
+```{r, include=FALSE, warning=FALSE, echo=FALSE}
+library(tidyverse) # for data manipulation
+library(lme4) # for linear mixed regression models
+library(lmerTest)# for p-value of lme4's models
+library(afex) # for repeated-measures ANOVA
+library(rstatix) # for repeated-measures ANOVA
+library(multcomp) # multiple comparisons
+library(emmeans) # pairwise-comparisons
+library(ggsci)
+library(RColorBrewer) # for some extra colours in one of the graphs
+library(table1) # make Table 1, mainly demographic & clinical info
+library(sjPlot) # plot interactions of lm/lmer outputs
+library(ggpubr) # plot multiple panels
+library(reshape2) # including melt function to plot heatmaps
+#library(brainGraph) # brain atlases & brain graph analyses
+```
+
+### (0) functions for analyses
+```{r,echo=FALSE}
+#######################################################################
+# a funciton to change outliers to NA, and NA to group mean in a column
+SDL_RmOut <- function(col){
+  Q <- quantile(col,na.rm=TRUE) # quantile, IQR = 75% - 25%
+  low <- Q[2]-1.5*(Q[4]-Q[2]) # lower limit = 25% - 1.5*IQR
+  up  <- Q[4]+1.5*(Q[4]-Q[2]) # upper limit = 75% + 1.5*IQR
+  col[col<low | col>up] <- NA # outlier are changed to NA
+  col[is.na(col)] <- mean(col,na.rm=T) # impute with group mean
+  col
+}
+#######################################################################
+
+
+#######################################################################
+# a function to model (lm or lmer) data for each ROI, and extract models/coefficients/p-values of models
+# Input
+# --- y, dataframe column, e.g. df$col01, or select(col1:col10)
+# --- df, dataframe
+# --- Otype, the type of outputs, e.g. "model", "coef", and "p"
+# --- ftxt, text for the formula, e.g. "lmer(formula = y ~ age_d + age_m + drinking_class + sex + race + ses + fh_alc_density + life_trauma_RP + (1|participant_id)"
+# --- fterms, which factor to be plotted
+# --- fxy, x and y labels
+# Output
+# --- model, list of models
+# --- coef,  matrix of coefficients
+# --- pval,  matrix of coefficients
+# --- plt,   list of plotting objects
+SDL_lm <- function(y,df,Otype,ftxt,fterms=NULL,fxy=NULL){
+  model <- eval(parse(text=paste(substr(ftxt,1,nchar(ftxt)-1),", data = df)")))
+  coef  <- model %>% summary() %>% coefficients()
+  pval  <- coef  %>% .[,"Pr(>|t|)"]
+  plt   <- model %>% plot_model(type = "pred", terms = fterms, title = "", axis.title = fxy)
+  switch(Otype,"model"=return(list(model)),"coef"=return(list(coef)),"pval"=return(pval),"plt"=return(list(plt)))
+}
+##############################################################################
+
+
+##############################################################################
+# A function to extract the values of designated parameter from the models worked out by the SDL_lm function
+# Input
+# --- model, model per ROI worked out by SDL_lm function
+# --- para, parameters to be extracted, including
+#          "Estimate", "Std. Error", "df", "t value", and "Pr(>|t|)", or
+#           1,2,3,4,5,6, in fatc, 3&4 are df1&df2
+# Output
+# --- mat, a matrix of extracted values, row=factor name, col=ROI name
+SDL_cp <- function(model,para="Pr(>|t|)"){
+  coef  <- model %>% summary() %>% coefficients()
+  mat  <- coef  %>% .[,para]
+  return(mat)
+}
+##############################################################################
+
+
+#######################################################################
+# a function to plot heatmap for matrix of coefficients or p-values
+# Input
+# --- x, a vector, e.g. Pval0['Group',]
+# --- title, title of the coclor bar, e.g. 'P-val (FDR corr.)'
+# --- fmidpoint, mid point of the color bar, e.g. 0.05
+# --- flimit, min and max of the color bar, e.g. c(0,1)
+# --- roi, rois (part or all of the 90 regions) to show
+# Output
+# --- a heatmap representing the input matrix
+SDL_mheat <- function(x,title='Pearson Correlation',fmidpoint=0,flimit=c(-1,1),roi=NULL){
+    # corr. coef. matrix
+  n <- 4 # 4 harmonization approaches
+  m <- matrix(data=0, nrow=n, ncol=n)
+  m[lower.tri(m, diag=FALSE)] <- x
+  m <- t(m)
+  m[lower.tri(m, diag=FALSE)] <- x
+  
+  roinames <- c('LME(int)', 'LME(int+slp)', 'ComBat', 'ComBat-GAM')
+  rownames(m) <- roinames
+  colnames(m) <- roinames
+
+  if (!is.null(roi)){m <- m[roi, roi]} # plot selected rois
+
+  # ggplot2 shows heatmap
+  mm <- melt(m)
+  
+  # head(mm)
+  mm %>% ggplot(aes(Var2, Var1, fill = value))+ geom_tile(color = "white")+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", midpoint = fmidpoint, limit = flimit, space = "Lab", name=title) +theme_minimal()+ theme(axis.text.x =element_text(angle = 90, vjust = 1, size = 12, hjust = 1))+coord_fixed()
+}
+#######################################################################
+
+##############################################################################
+# Load coordinates of Destrieux atlas (74 L + 74 R)
+atlas <- read.csv("..\\Original\\atlas-label.csv",header=T,sep=",")
+##############################################################################
+
+
+##############################################################################
+# a function to show heatmap of differences in coef.
+### for Fig. 4D,5D,6D,7D,8D
+# Input
+# --- coef_df, df of regression coefficients
+# Output
+# --- plot a heatmap of pairwise comparisons of coefficients
+SDL_heatmap_coef <- function(coef_df){
+  # show the ANOVA results
+  a <- coef_df %>% rename('LME(int)'='LME', 'LME(int+slp)'='LME+Slope') %>% mutate(ROI=rownames(.)) %>% pivot_longer(!ROI, names_to = "Method", values_to = "coef") %>% aov_ez("ROI", "coef", ., within = c("Method"))
+knitr::kable(nice(a)) %>% print() # ANOVA results
+
+  # show the matrix of pairwise comparisons
+  c <- a %>% emmeans(~ Method) %>% pwpm() %>% .[1:4,1:4] %>% t() # matrix of pairwise comp
+  rownames(c) <- c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM")
+  colnames(c) <- c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM")
+  print(c)
+
+  # p-values
+  d <- c %>% t()
+  d[lower.tri(d)] <- NA
+  diag(d) <- NA # remove the diagonal of estimated marginals
+  melted_txt <- d %>% melt(na.rm = TRUE)
+  melted_txt$value <- melted_txt$value %>% substr(1,6)
+  colnames(melted_txt) <- c('Var1','Var2','txt')
+
+  # coefficients
+  c[lower.tri(c)] <- NA
+  diag(c) <- 0
+  melted_cormat <- c %>% melt(na.rm = TRUE)
+  melted_cormat$value <- melted_cormat$value %>% as.numeric()
+
+  melted <- melted_cormat %>% merge(melted_txt, by=c('Var1','Var2'))
+
+
+  melted %>% ggplot(aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+ scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+   midpoint = 0, space = "Lab", #breaks=c(round(min(melted_cormat$value),digits=4),0.0000,round(max(melted_cormat$value),digits=4)),
+   name="Diff. in Coef.") +
+  theme_minimal()+ 
+ theme(axis.title=element_blank(), axis.text.x = element_text(angle = 45, vjust = 1, size = 12, hjust = 1))+coord_fixed()+ 
+geom_text(aes(Var2, Var1, label = txt), color = "black", size = 4) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = c(0.6, 0.7),
+  legend.direction = "horizontal"
+  )+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "top", title.hjust = 0.5))
+}
+##############################################################################
+```
+
+
+
+
+# (1) Data Loading, Cleaning & Saving
+```{r,echo=FALSE}
+# dataframe after removing outliers
+df <- read.csv("..\\Original\\PGC_PTSD_CT.csv",header=T,sep=",") %>% # 3504 subjects loaded
+  filter(Included > 0) %>% # remove rows Emily marked as bad, 3438 subjects remained
+  dplyr::select(SubjID:SiteName) %>% # select columns of interest
+  group_by(SiteName) %>% # group by site
+  mutate_at(names(.)[2:149],SDL_RmOut) %>% # replace outliers with group mean for each ROI.The column name list can be replaced by vars(starts_with("L_")) and vars(starts_with("R_"))
+  drop_na() # remove rows with NA, 3410 subjects remained
+
+df$mean <- rowMeans(df[,2:149]) # mean across ROIs
+
+
+# save Data & Cov for ComBat-GAM run in Python
+df$SITE <- df$Site # Site should be SITE for COMBAT-GAMs
+write.csv(df[,2:149],'data.csv',row.names=FALSE) # data per ROI
+write.csv(df[,c("Age","Gender","Group","SITE")],'subject_info.csv',row.names=FALSE) 
+
+# save Data & Cov for Hierarchical Basian Regression (HBR)
+write.table(df[,2],'data.txt',sep='\t',row.names=FALSE,col.names=FALSE) # data per ROI
+write.table(df[,"Age"],'cov.txt',sep='\t',row.names=FALSE,col.names=FALSE) 
+write.table(df[,c("Gender")]-1,'batch.txt',sep='\t',row.names=FALSE,col.names=FALSE) 
+
+# revise site names
+df$SiteName <- df$SiteName %>% str_replace_all(c("ADNIDOD"="ADNIDoD", "AMC"="Amsterdam Medical Center","Columbia"="Columbia University","DeBellis"="Duke University-De Bellis","Duke"="Duke University-Morey","Ghent"="Ghent University","Groningen"="University of Groningen","Grupe"="U.W. Madison-Grupe","GTP"="Emory University-GTP","INTRUST"="INTRuST","Larson"="U.W. Milwaukee-Larson","Leiden"="Leiden University","Mannheim"="University of Mannheim","McLean"="Harvard University-McLean","Minneapolis"="Minneapolis V.A.-Disner","Munster"="University of Münster","Phan"="University of Illinois-Chicago","Rosso"="Harvard University-Rosso","SouthDakota"="University of South Dakota","Stanford"="Stanford University","Stellenbosch"="Stellenbosch University","Toledo"="University of Toledo","UCAS"="UCAS-Beijing","UCT"="University of Cape Town","UNSW"="University of Sydney-Westmead","Uwash"="University of Washington","Waco"="Waco V.A.","WestHaven"="University of New Haven","Yale"="Yale University"))
+
+
+df0 <- df # df0 is the cleaned data for backup
+
+```
+
+# (2) Harmonization
+## (2.1)ComBatHarmonization (standard ComBat)
+from https://github.com/Jfortin1/ComBatHarmonization
+```{r}
+source("ComBatHarmonization/utils.R"); # install some packages first
+source("ComBatHarmonization/combat.R") # load R scripts
+
+df <- df0
+# Our data
+dat <-t(df[,2:149]) # Num. of features x Num. of participants
+batch <- df$Site # variables of no interest
+age <- df$Age
+sex <- df$Gender %>% as.factor()
+disease <- df$Group %>% as.factor()
+mod <- model.matrix(~age + sex + disease) # variables of interest
+combat.harmonized <- combat(dat=dat, batch=batch, mod=mod, parametric=TRUE, eb=TRUE) 
+# non-parametric adjustment is time consuming!!!
+# Empirical Bayes (eb) is NOT needed when (1) The number of features is substantially smaller than the number of participants or (2) The prior distributions used in ComBat do not fit well the data (3) The site effects are only present for a small subset of features
+
+df1 <- df
+df1[,2:149] <- combat.harmonized$dat.combat %>% t() %>% as.data.frame() # harmonized data
+df1$mean <- df1[,2:149] %>% rowMeans() # get the mean CT per subject
+
+```
+
+
+## (2.2) ComBat-GAM
+GAMS = Generalized Additive Models
+from https://github.com/rpomponio/neuroHarmonize
+
+Run the below codes in Anaconda Prompt not in R Markdown, because there is now no way to install the neuroHarmonize package using R Markdown 
+==========
+#import pandas as pd
+#import numpy as np
+#from neuroHarmonize import harmonizationLearn # need to know how to run neuroHarmonize here
+
+#my_data = pd.read_csv('data.csv') # brain data
+#my_data = np.array(my_data) # convert into array
+#covars = pd.read_csv('subject_info.csv') # covariates of interest.
+#my_model, my_data_adj = harmonizationLearn(my_data,covars,smooth_terms=['Age']) # the smooth_terms specifie age as a nonlinear term in the harmonization model
+
+# save harmonized data into csv file
+#np.savetxt("neuroHarmonize.csv", my_data_adj, delimiter=",")
+==========
+```{r,echo=FALSE}
+#library(reticulate) # to run ComBat-GAMs
+#py_install("pandas")
+#py_install("numpy")
+#py_install("statsmodels")
+df2 <- df0
+df2[,2:149] <- read.csv("neuroHarmonize.csv", header = FALSE,sep=",") #
+df2 <- df2 %>% ungroup() %>% # drop grouping in df
+  mutate(mean = rowMeans(.[,2:149])) # mean across ROIs
+```
+
+
+
+## (2.3) ComBat++
+from https://github.com/ai-med/Dataset-Bias
+```{r}
+source("Dataset-Bias-master/ComBat++/utils.R");  # install some packages first
+source("Dataset-Bias-master/ComBat++/combatPP.R") # load R scripts
+
+# Our data
+df <- df0
+dat <-t(df[,2:149]) # Num. of features x Num. of participants
+batch <- df$Site # variables of no interest
+age <- df$Age
+sex <- df$Gender %>% as.factor()
+disease <- df$Group %>% as.factor()
+mod <- model.matrix(~age + sex + disease) # variables of interest
+
+prcomps <- princomp(t(dat)) # PCA analyses
+PCs <- predict(prcomps,t(dat))
+var_remove <- PCs[,c(1,2)] # variables of no interest
+
+#mod_remove <- model.matrix(~ MFS) # variables of no interest, magnetic field strength (MFS)
+#var_remove <- cbind(mod_remove,PCs[,c(1,2)]) # combine variables of no interest
+
+data.harmonized <- combatPP(dat=dat,PC=var_remove,mod=mod,batch=batch,parametric=TRUE,eb=TRUE) # ComBat++
+
+# non-parametric adjustment is time consuming!!!
+# Empirical Bayes (eb) is NOT needed when (1) The number of features is substantially smaller than the number of participants or (2) The prior distributions used in ComBat do not fit well the data (3) The site effects are only present for a small subset of features
+
+df3 <- df
+df3[,2:149] <- data.harmonized$dat.combat %>% t() %>% as.data.frame() # harmonized data
+df3$mean <- df3[,2:149] %>% rowMeans() # get the mean CT per subject
+
+```
+
+
+## (2.4) Hierarchical Bayesian regression (HBR)
+codes from https://github.com/amarquand/PCNtoolkit
+instructions from  https://github.com/amarquand/PCNtoolkit/wiki/Normative-Modelling
+paper from https://arxiv.org/pdf/2005.12055.pdf
+
+Run the below codes in Anaconda Prompt not in R Markdown 
+==========
+#import pandas as pd
+#import numpy as np
+#from pcntoolkit.normative import estimate, evaluate
+
+# python normative.py -c subject_info.txt -k 5 -a blr data.txt
+
+# save harmonized data into csv file
+#np.savetxt("neuroHarmonize.csv", my_data_adj, delimiter=",")
+==========
+```{r,echo=FALSE}
+#library(reticulate) # to run ComBat-GAMs
+#py_install("pandas")
+#py_install("numpy")
+#py_install("statsmodels")
+df4 <- df0
+df4[,2:149] <- read.csv("neuroHarmonize.csv", header = FALSE,sep=",") #
+df4 <- df4 %>% ungroup() %>% # drop grouping in df
+  mutate(mean = rowMeans(.[,2:149])) # mean across ROIs
+```
+
+
+
+
+
+
+# (3) Basic statistics and plots
+
+## (3.0a) Table 1, demographic information
+```{r,echo=FALSE}
+df <- df0 
+
+# re-define the factors' levels
+df$Gender <- df0$Gender %>% as.factor() %>% plyr::revalue(c("2"="Female", "1"="Male"))
+df$Group  <- df0$Group  %>% as.factor() %>% plyr::revalue(c("2"="Control","1"="PTSD"))
+
+# Statistics of demographic info
+## Control
+df_CONT <- df %>% filter(Group=="Control") %>% group_by(SiteName) %>% get_summary_stats(Age, type = "mean_sd") # number of subjects & meand/SD of Age
+df_CONT <- df %>% filter(Group=="Control" & Gender=='Male') %>% group_by(SiteName) %>% summarise(N_male=n()) %>% merge(df_CONT,by="SiteName",all=TRUE) # add number of males
+df_CONT <- df %>% filter(Group=="Control" & Gender=='Female') %>% group_by(SiteName) %>% summarise(N_female=n()) %>% merge(df_CONT,by="SiteName",all=TRUE) # add number of males
+## PTSD
+df_PTSD <- df %>% filter(Group=="PTSD") %>% group_by(SiteName) %>% get_summary_stats(Age, type = "mean_sd") # number of subjects & meand/SD of Age
+df_PTSD <- df %>% filter(Group=="PTSD" & Gender=='Male') %>% group_by(SiteName) %>% summarise(N_male=n()) %>% merge(df_PTSD,by="SiteName",all=TRUE) # add number of males
+df_PTSD <- df %>% filter(Group=="PTSD" & Gender=='Female') %>% group_by(SiteName) %>% summarise(N_female=n()) %>% merge(df_PTSD,by="SiteName",all=TRUE) # add number of males
+## merge Control and PTSD
+df <- merge(df_CONT,df_PTSD,by="SiteName",all=TRUE)
+write.csv(df,'Table1.csv',row.names=FALSE) # data per ROI
+df
+```
+
+## (3.1) plot site-specific age-related changes in cortical thickness (Fig. 1)
+```{r,echo=FALSE}
+plt1 <- df %>% ggplot(aes(x=Age, y=mean, col=SiteName))+ geom_point(size=1, alpha=0.5)+ labs(y="Cortical Thickness") +geom_smooth(method=lm, se=FALSE)+ theme_minimal()+ theme(legend.title=element_blank(),legend.position="right", legend.text=element_text(size=7))
+plt1
+
+```
+
+
+## (3.2) Boxplot of site effects (Fig. 2)
+```{r,warning=FALSE,echo=FALSE}
+df <- df0
+# Raw
+plt1 <- df %>% filter(Group==1) %>% ggplot(aes(x = SiteName,y = mean,col = SiteName)) + geom_boxplot() + theme(legend.title=element_blank(),legend.text=element_text(size=6),legend.position = "none",axis.text.y=element_blank(), axis.ticks = element_blank()) + labs(title = "Raw",x="",y="") + ylim(1.85,2.96)+ coord_flip() # raw, PTSD
+plt2 <- df %>% filter(Group==2) %>% ggplot(aes(x = SiteName,y = mean,col = SiteName)) + geom_boxplot() + theme(legend.title=element_blank(),legend.text=element_text(size=6),legend.position = "none",axis.text.y = element_blank(), axis.ticks = element_blank()) + labs(title = "",x="",y="") + ylim(1.85,2.96)+ coord_flip() # raw, non-PTSD
+
+# ComBat
+plt3 <- df1 %>% filter(Group==1) %>% ggplot(aes(x = SiteName,y = mean,col = SiteName,)) + geom_boxplot() + theme(legend.title=element_blank(),legend.text=element_text(size=6),legend.position = "none",axis.text.y=element_blank(), axis.ticks = element_blank())+ labs(title = "ComBat",x="",y="") + ylim(1.85,2.96)+ coord_flip() # ComBat,PTSD
+plt4 <- df1 %>% filter(Group==2) %>% ggplot(aes(x = SiteName,y = mean,col = SiteName,)) + geom_boxplot() + theme(legend.title=element_blank(),legend.text=element_text(size=6),legend.position = "none",axis.text.y = element_blank(), axis.ticks = element_blank())+ labs(title = "",x="",y="") + ylim(1.85,2.96)+ coord_flip() # ComBat,non-PTSD
+
+#ComBat-GAM
+plt5 <- df2 %>% filter(Group==1) %>% ggplot(aes(x = SiteName,y = mean,col = SiteName,)) + geom_boxplot() + theme(legend.title=element_blank(),legend.text=element_text(size=6),legend.position = "none",axis.text.y=element_blank(), axis.ticks = element_blank())+ labs(title = "ComBat-GAM",x="",y="") + ylim(1.85,2.96)+ coord_flip() # ComBat-GAM,PTSD
+plt6 <- df2 %>% filter(Group==2) %>% ggplot(aes(x = SiteName,y = mean,col = SiteName,)) + geom_boxplot() + theme(legend.title=element_blank(),legend.text=element_text(size=6),legend.position = "none", axis.text.y = element_blank(), axis.ticks = element_blank())+ labs(title = "",x="",y="") + ylim(1.85,2.96)+ coord_flip() # ComBat-GAM,non-PTSD
+
+#ComBat++
+plt7 <- df3 %>% filter(Group==1) %>% ggplot(aes(x = SiteName,y = mean,col = SiteName,)) + geom_boxplot() + theme(legend.title=element_blank(),legend.text=element_text(size=6),legend.position = "none",axis.text.x = element_blank(), axis.text.y = element_blank(), axis.ticks = element_blank())+ labs(title = "ComBat++,PTSD",x="",y="") + ylim(1.85,2.96)
+plt8 <- df3 %>% filter(Group==2) %>% ggplot(aes(x = SiteName,y = mean,col = SiteName,)) + geom_boxplot() + theme(legend.title=element_blank(),legend.text=element_text(size=6),legend.position = "none",axis.text.x = element_blank(), axis.text.y = element_blank(), axis.ticks = element_blank())+ labs(title = "ComBat++,non-PTSD",x="",y="") + ylim(1.85,2.96)
+
+#Plots
+ggarrange(plt1,plt3,plt5,plt2,plt4,plt6,ncol=3,labels=NULL,common.legend=T) # Raw, ComBat, ComBat-GAM
+# ggarrange(plt1,plt2,plt3,plt4,plt5,plt6,ncol=2,labels=NULL,legend="none", common.legend=F) # Raw, ComBat, ComBat-GAM
+# ggarrange(plt5,plt7,plt6,plt8, labels=NULL,common.legend=F) # ComBat-GAM, ComBat++
+```       
+
+### Fig. 2 related statistical analyses
+```{r,echo=FALSE}
+# names of ROIs
+roilist <- df %>% dplyr::select(L_G_and_S_frontomargin:R_S_temporal_transverse) %>% colnames() #%>% t() %>% as.data.frame()
+
+plist <- data.frame(Statistics = c("tm_PAT_CvG","tm_PAT_CvR","tm_PAT_GvR","pm_PAT_CvG","pm_PAT_CvR","pm_PAT_GvR","tm_CON_CvG","tm_CON_CvR","tm_CON_GvR","pm_CON_CvG","pm_CON_CvR","pm_CON_GvR","tSD_PAT_CvG","tSD_PAT_CvR","tSD_PAT_GvR","pSD_PAT_CvG","pSD_PAT_CvR","pSD_PAT_GvR","tSD_CON_CvG","tSD_CON_CvR","tSD_CON_GvR","pSD_CON_CvG","pSD_CON_CvR","pSD_CON_GvR"))
+
+# 
+for (col in roilist[2:length(roilist)]) {
+
+#col="mean"
+df <- df0
+# # Raw data
+dfx_raw_PAT <- df %>% filter(Group==1) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_raw_PAT$Method <- "Raw"
+dfx_raw_PAT$nmean <- abs(dfx_raw_PAT$mean-mean(dfx_raw_PAT$mean)) # absolute value of variances
+
+dfx_raw_CON <- df %>% filter(Group==2) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_raw_CON$Method <- "Raw"
+dfx_raw_CON$nmean <- abs(dfx_raw_CON$mean-mean(dfx_raw_CON$mean))
+
+# ComBat harmonized data
+dfx_ComBat_PAT <- df1 %>% filter(Group==1) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_ComBat_PAT$Method <- "ComBat"
+dfx_ComBat_PAT$nmean <- abs(dfx_ComBat_PAT$mean-mean(dfx_ComBat_PAT$mean))
+
+dfx_ComBat_CON <- df1 %>% filter(Group==2) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_ComBat_CON$Method <- "ComBat"
+dfx_ComBat_CON$nmean <- abs(dfx_ComBat_CON$mean-mean(dfx_ComBat_CON$mean))
+
+# ComBat-GAM harmonized data
+dfx_ComBatGAM_PAT <- df2 %>% filter(Group==1) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_ComBatGAM_PAT$Method <- "ComBatGAM"
+dfx_ComBatGAM_PAT$nmean <- abs(dfx_ComBatGAM_PAT$mean-mean(dfx_ComBatGAM_PAT$mean))
+
+dfx_ComBatGAM_CON <- df2 %>% filter(Group==2) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_ComBatGAM_CON$Method <- "ComBatGAM"
+dfx_ComBatGAM_CON$nmean <- abs(dfx_ComBatGAM_CON$mean-mean(dfx_ComBatGAM_CON$mean))
+
+# Get t-values & p-values for pairwise comparisons
+# 6 outputs are ComBat-vs-ComBatGAM, ComBat-vs-Raw, ComBatGAM-vs-Raw, respectively.
+# first 3 outputs are t-values, last 3 outputs are p-values
+# P-values are adjusted using Tukey method. with sign to represent the contrast direction.
+
+# PAT
+dfx_PAT <- rbind(dfx_raw_PAT, dfx_ComBat_PAT, dfx_ComBatGAM_PAT) # combined for aov
+
+tmp <- aov(nmean ~ Method + Error(SiteName / Method), data = dfx_PAT) %>% emmeans(~ Method) %>% pairs() %>% summary() # ??? This step always meets error when using sapply to run the codes in this chunk
+pM_PAT <- c(tmp$t.ratio, tmp$p.value * sign(tmp$estimate)) # sign of p-values represent the direction of contrast
+
+tmp <- aov(sd ~ Method + Error(SiteName / Method), data = dfx_PAT) %>% emmeans(~ Method) %>% pairs() %>% summary()
+pSD_PAT <- c(tmp$t.ratio, tmp$p.value * sign(tmp$estimate))
+
+# CON
+dfx_CON <- rbind(dfx_raw_CON, dfx_ComBat_CON, dfx_ComBatGAM_CON) # combined for aov
+
+tmp <- aov(nmean ~ Method + Error(SiteName / Method), data = dfx_CON) %>% emmeans(~ Method) %>% pairs() %>% summary()
+pM_CON <- c(tmp$t.ratio, tmp$p.value * sign(tmp$estimate)) # sign of p-values represent the direction of contrast
+
+tmp <- aov(sd ~ Method + Error(SiteName / Method), data = dfx_CON) %>% emmeans(~ Method) %>% pairs() %>% summary()
+pSD_CON <- c(tmp$t.ratio, tmp$p.value * sign(tmp$estimate))
+
+plist[,col] <- c(pM_PAT, pM_CON, pSD_PAT, pSD_CON)
+}
+
+# save results
+write.csv(plist,'plist_Fig2.csv',row.names=FALSE)
+```
+```{r,echo=FALSE}
+# a small function to show t- & p-values (Tukey & fdr corrected)
+SDL_tval <- function(txtm, txtp){
+  vm <- plist[plist$Statistics==txtm,2:dim(plist)[2]]
+  vp <- plist[plist$Statistics==txtp,2:dim(plist)[2]] %>% abs() %>% p.adjust(method="fdr")
+  print(paste(txtm,":min=",min(vm)," max=",max(vm),";",txtp,":min=",min(vp)," max=",max(vp)))
+  }
+
+# Comparisons of variances
+SDL_tval("tm_CON_CvR", "pm_CON_CvR") # CON, ComBat vs Raw
+SDL_tval("tm_PAT_CvR", "pm_PAT_CvR") # PAT, ComBat vs Raw
+
+SDL_tval("tm_CON_GvR", "pm_CON_GvR") # CON, ComBat-GAM vs Raw
+SDL_tval("tm_PAT_GvR", "pm_PAT_GvR") # PAT, ComBat-GAM vs Raw
+
+SDL_tval("tm_CON_CvG", "pm_CON_CvG") # PAT, ComBat vs ComBat-GAM
+SDL_tval("tm_PAT_CvG", "pm_PAT_CvG") # PAT, ComBat vs ComBat-GAM
+
+# Comparisons of SDs
+SDL_tval("tSD_CON_CvR", "pSD_CON_CvR") # CON, ComBat vs Raw
+SDL_tval("tSD_PAT_CvR", "pSD_PAT_CvR") # PAT, ComBat vs Raw
+
+SDL_tval("tSD_CON_GvR", "pSD_CON_GvR") # CON, ComBat-GAM vs Raw
+SDL_tval("tSD_PAT_GvR", "pSD_PAT_GvR") # PAT, ComBat-GAM vs Raw
+
+SDL_tval("tSD_CON_CvG", "pSD_CON_CvG") # PAT, ComBat vs ComBat-GAM
+SDL_tval("tSD_PAT_CvG", "pSD_PAT_CvG") # PAT, ComBat vs ComBat-GAM
+
+```
+
+
+### Fig. 3 related statistical analyses
+```{r,echo=FALSE}
+# names of ROIs
+roilist <- df %>% dplyr::select(L_G_and_S_frontomargin:R_S_temporal_transverse) %>% colnames()
+
+plist <- data.frame(Statistics = c("tm_PAT_CvG","tm_PAT_CvR","tm_PAT_GvR","pm_PAT_CvG","pm_PAT_CvR","pm_PAT_GvR","tm_CON_CvG","tm_CON_CvR","tm_CON_GvR","pm_CON_CvG","pm_CON_CvR","pm_CON_GvR","tSD_PAT_CvG","tSD_PAT_CvR","tSD_PAT_GvR","pSD_PAT_CvG","pSD_PAT_CvR","pSD_PAT_GvR","tSD_CON_CvG","tSD_CON_CvR","tSD_CON_GvR","pSD_CON_CvG","pSD_CON_CvR","pSD_CON_GvR"))
+
+
+# Age <=20
+# # Raw data
+df <- df0
+df$Method <- "Raw"
+df1$Method <- "ComBat"
+df2$Method <- "ComBatGAM"
+
+dfx <- rbind(df,df1,df2)
+
+dfx_young_PAT <- dfx %>% ungroup() %>% filter(Group==1 & Age<=20)
+dfx_young_CON <- dfx %>% ungroup() %>% filter(Group==2 & Age<=20)
+
+dfx_old_PAT <- dfx %>% ungroup() %>% filter(Group==1 & Age>20)
+dfx_old_CON <- dfx %>% ungroup() %>% filter(Group==2 & Age>20)
+
+for (col in roilist[2:length(roilist)]) {
+
+  col = roilist[2]
+  
+
+dfx_young_PAT$nmean <- abs(dfx_raw_PAT$mean-mean(dfx_raw_PAT$mean)) # absolute value of variances
+
+dfx_raw_CON <- df %>% filter(Group==2) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_raw_CON$Method <- "Raw"
+dfx_raw_CON$nmean <- abs(dfx_raw_CON$mean-mean(dfx_raw_CON$mean))
+
+# ComBat harmonized data
+dfx_ComBat_PAT <- df1 %>% filter(Group==1) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_ComBat_PAT$Method <- "ComBat"
+dfx_ComBat_PAT$nmean <- abs(dfx_ComBat_PAT$mean-mean(dfx_ComBat_PAT$mean))
+
+dfx_ComBat_CON <- df1 %>% filter(Group==2) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_ComBat_CON$Method <- "ComBat"
+dfx_ComBat_CON$nmean <- abs(dfx_ComBat_CON$mean-mean(dfx_ComBat_CON$mean))
+
+# ComBat-GAM harmonized data
+dfx_ComBatGAM_PAT <- df2 %>% filter(Group==1) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_ComBatGAM_PAT$Method <- "ComBatGAM"
+dfx_ComBatGAM_PAT$nmean <- abs(dfx_ComBatGAM_PAT$mean-mean(dfx_ComBatGAM_PAT$mean))
+
+dfx_ComBatGAM_CON <- df2 %>% filter(Group==2) %>% group_by(SiteName) %>% get_summary_stats(col,type="mean_sd")
+dfx_ComBatGAM_CON$Method <- "ComBatGAM"
+dfx_ComBatGAM_CON$nmean <- abs(dfx_ComBatGAM_CON$mean-mean(dfx_ComBatGAM_CON$mean))
+
+# Get t-values & p-values for pairwise comparisons
+# 6 outputs are ComBat-vs-ComBatGAM, ComBat-vs-Raw, ComBatGAM-vs-Raw, respectively.
+# first 3 outputs are t-values, last 3 outputs are p-values
+# P-values are adjusted using Tukey method. with sign to represent the contrast direction.
+
+# PAT
+dfx_PAT <- rbind(dfx_raw_PAT, dfx_ComBat_PAT, dfx_ComBatGAM_PAT) # combined for aov
+
+tmp <- aov(nmean ~ Method + Error(SiteName / Method), data = dfx_PAT) %>% emmeans(~ Method) %>% pairs() %>% summary() # ??? This step always meets error when using sapply to run the codes in this chunk
+pM_PAT <- c(tmp$t.ratio, tmp$p.value * sign(tmp$estimate)) # sign of p-values represent the direction of contrast
+
+tmp <- aov(sd ~ Method + Error(SiteName / Method), data = dfx_PAT) %>% emmeans(~ Method) %>% pairs() %>% summary()
+pSD_PAT <- c(tmp$t.ratio, tmp$p.value * sign(tmp$estimate))
+
+# CON
+dfx_CON <- rbind(dfx_raw_CON, dfx_ComBat_CON, dfx_ComBatGAM_CON) # combined for aov
+
+tmp <- aov(nmean ~ Method + Error(SiteName / Method), data = dfx_CON) %>% emmeans(~ Method) %>% pairs() %>% summary()
+pM_CON <- c(tmp$t.ratio, tmp$p.value * sign(tmp$estimate)) # sign of p-values represent the direction of contrast
+
+tmp <- aov(sd ~ Method + Error(SiteName / Method), data = dfx_CON) %>% emmeans(~ Method) %>% pairs() %>% summary()
+pSD_CON <- c(tmp$t.ratio, tmp$p.value * sign(tmp$estimate))
+
+plist[,col] <- c(pM_PAT, pM_CON, pSD_PAT, pSD_CON)
+}
+
+# save results
+write.csv(plist,'plist_Fig3.csv',row.names=FALSE)
+```
+
+## (3.3) plot mean CT vs. Age (nonlinear curves) (Fig. 3)
+Colors and curves for different groups
+```{r, warning=FALSE, echo=FALSE}
+#df <- dt_filt # data after removing outliers
+plt1 <- df %>% ggplot(aes(x = Age, y = mean, col = as.factor(Group))) + geom_point(size = 0.9, alpha = 1) + geom_smooth(method = 'loess', se = T, size = 1, linetype = 1, alpha = 1) + theme_minimal() + labs(title="A", subtitle = "Raw", y="Cortical Thickness") + scale_color_manual(name ="", labels = c("PTSD", "Control"), values = c("pink", "lightblue")) + ylim(1.85,2.96)
+
+plt2 <- df1 %>% ggplot(aes(x = Age, y = mean, col = as.factor(Group))) + geom_point(size = 0.9, alpha = 1) + geom_smooth(method = 'loess', se = T, size = 1, linetype = 1, alpha = 1) + theme_minimal() + labs(title="B", subtitle = "ComBat",y="") + theme(legend.position = "none",axis.text.y = element_blank(), axis.ticks = element_blank())+ scale_color_manual(name ="", labels = c("PTSD", "Control"), values = c("pink", "lightblue")) + ylim(1.85,2.96)
+
+plt3 <- df2 %>% ggplot(aes(x = Age, y = mean, col = as.factor(Group))) + geom_point(size = 0.9, alpha = 1) + geom_smooth(method = 'loess', se = T, size = 1, linetype = 1, alpha = 1) + theme_minimal() + labs(title="C", subtitle = "ComBat-GAM", y = "") + theme(legend.position = "none", axis.text.y = element_blank(), axis.ticks = element_blank()) + scale_color_manual(name ="", labels = c("PTSD", "Control"), values = c("pink", "lightblue")) + ylim(1.85,2.96)
+
+plt4 <- df3 %>% ggplot(aes(x = Age, y = mean, col = as.factor(Group))) + geom_point(size = 1, alpha = .7) + geom_smooth(method = 'loess', formula = y ~ x +x^2, se = T, size = 1.5, linetype = 1, alpha = .7) + theme_minimal() + labs(title = "ComBat++") + theme(legend.position = "none",axis.text.y = element_blank(), axis.ticks = element_blank()) + scale_color_manual(name ="", labels = c("PTSD", "Control"), values = c("pink", "lightblue")) + ylim(1.85,2.96)
+
+ggarrange(plt1,plt2,plt3, ncol=3,labels="",common.legend=T) # multiple plots
+ggarrange(plt1,plt2,plt3,plt4, ncol=4,labels="",common.legend=T) # multiple plots
+```
+## (4) Statistical models across ROIs
+
+### (4.4.1alpha) Model: Group + Age + Sex (no interaction), plotting coefficients & p-values
+```{r,echo=FALSE,warning=FALSE}
+# No Harmonized
+df <- df0
+df[df$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df[,2:149] %>% sapply(SDL_lm, df=df, Otype="model", ftxt="lmer(formula = y ~ Group + Age + Gender + (1 |Site))")
+Pval1a <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef1a <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+Modelx <- df[,2:149] %>% sapply(SDL_lm, df=df, Otype="model", ftxt="lmer(formula = y ~ Group + Age + Gender + (1+Age | SITE), control=lmerControl(optimizer='bobyqa'))")
+Pval1b <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef1b <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat
+df1[df1$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df1[,2:149] %>% sapply(SDL_lm, df=df1, Otype="model", ftxt="lm(formula = y ~ Group + Age + Gender)")
+Pval2 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef2 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat-GAM
+df2[df2$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df2[,2:149] %>% sapply(SDL_lm, df=df2, Otype="model", ftxt="lm(formula = y ~ Group + Age + Gender)")
+Pval3 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef3 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat++
+df3[df3$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df3[,2:149] %>% sapply(SDL_lm, df=df3, Otype="model", ftxt="lm(formula = y ~ Group + Age + Gender)")
+Pval4 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef4 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# effects of Group
+Coef_Group <- cbind(Coef1a[,2],Coef1b[,2],Coef2[,2],Coef3[,2],Coef4[,2]) %>% as.data.frame(row.names = rownames(Pval1a))
+colnames(Coef_Group) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+Pval_Group <- cbind(Pval1a[,2],Pval1b[,2],Pval2[,2],Pval3[,2],Pval4[,2])
+colnames(Pval_Group) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+
+# effects of Age
+Coef_Age <- cbind(Coef1a[,3],Coef1b[,3],Coef2[,3],Coef3[,3],Coef4[,3]) %>% as.data.frame(row.names = rownames(Pval1a))
+colnames(Coef_Age) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+Pval_Age <- cbind(Pval1a[,3],Pval1b[,3],Pval2[,3],Pval3[,3],Pval4[,3])
+colnames(Pval_Age) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+
+# effects of Sex
+Coef_Sex <- cbind(Coef1a[,4],Coef1b[,4],Coef2[,4],Coef3[,4],Coef4[,4]) %>% as.data.frame(row.names = rownames(Pval1a))
+colnames(Coef_Sex) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+Pval_Sex <- cbind(Pval1a[,4],Pval1b[,4],Pval2[,4],Pval3[,4],Pval4[,4])
+colnames(Pval_Sex) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+```
+
+### Fig. 4D,5D,7D
+```{r, echo=FALSE}
+# main effect of Group
+Coef_Group[,1:4] %>% SDL_heatmap_coef()
+
+# main effect of Age
+Coef_Age[,1:4] %>% SDL_heatmap_coef()
+
+# main effect of Sex
+Coef_Sex[,1:4] %>% SDL_heatmap_coef()
+```
+
+
+
+# Plot Group effect
+### Fig. 4A,B&C
+```{r,echo=FALSE}
+dfp <- cbind(Coef_Group,Pval_Group) # new dataframe for plot purpose
+dfp <- dfp[order(dfp[,4]),] # sort the values according to the coef. of Combat-GAM (ascending order)
+order_group <- order(dfp[,4]) # order of the group effect, to plot group difference of raw value
+Region <- rep(1:148,times=4)
+Coefficient <- dfp[,1:4] %>% as.matrix() %>% as.vector()
+P_value <- dfp[,6:9] %>% as.matrix() %>% as.vector() 
+Method <- rep(c('LME (int)','LME (int+slp)','ComBat','ComBat-GAM'),each=148)
+plt1 <- data.frame(Region,Coefficient,Method) %>% ggplot(aes(x=Region,y=Coefficient,col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip()
+plt2 <- data.frame(Region,P_value,Method) %>% ggplot(aes(x=Region,y=-1*log10(P_value),col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip()  +ylab('-log10(p-value)') + geom_hline(yintercept=-1*log10(0.05),linetype="dashed", size=1) + geom_hline(yintercept=-1*log10(0.05/148),linetype="solid", size=1)
+ggarrange(plt2,plt1, labels=c("A","C"),legend='top',common.legend=T) # multiple plots
+
+## print significant results 
+### can also see whether the findings were reported by the other approaches
+print(dfp[dfp[,9]<0.05/148,c(4,6,7,8,9)]*148) # ComBat-GAM, 25 regions significant
+print(dfp[dfp[,8]<0.05/148,c(3,6,7,8,9)]*148) # ComBat, 6 regions significant
+print(dfp[dfp[,7]<0.05/148,c(2,6,7,8,9)]*148) # LME(int+slp), 4 regions significant
+print(dfp[dfp[,6]<0.05/148,c(1,6,7,8,9)]*148) # LME(int), 4 regions significant
+
+
+chi <- c(25, 148-25, 6, 148-6, 4, 148-4, 4, 148-4) %>% matrix(nrow=2, ncol=4, dimnames=list(c("Sig","NoSig"), c("ComBat-GAM","ComBat","LME(int)","LME(int+slp)"))) %>%  chisq.test()
+
+chi$observed
+
+
+## heatmap of the proportion of regions detected by method#A are also detected by method#B
+mat <- matrix(0,4,4,dimnames=list(c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM"), c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM"))) # make a zero matrix of 4 rows and 4 columns
+for (i in c(1,2,3,4)){
+  for (j in c(1,2,3,4)){
+    # total number of significant regions
+    n_total <- dfp %>% .[.[,i+5]<0.05/148,] %>% dim() %>% .[1] 
+    # number of both significant regions
+    n_both  <- dfp %>% .[.[,i+5]<0.05/148 & .[,j+5]<0.05/148,] %>% dim() %>% .[1]
+    # proportion of regions detected by method#i that are also detected by method#j
+    mat[i,j] <- n_both/n_total*100 %>% round(digits=1)
+  }
+}
+# heatmap
+mat %>% melt() %>% ggplot(aes(Var2, Var1, fill = value))+ geom_tile(color = "white")+ scale_fill_gradient2(low="blue", mid="white", high="red", midpoint=50, limit =c(0,100), name="%") +theme_minimal()+ theme(axis.text.x=element_text(angle = 45, vjust = 1, size = 12, hjust = 1))+coord_fixed()+ 
+geom_text(aes(Var2, Var1, label=round(value,1)), color = "black", size = 4) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = "top",
+  legend.direction = "horizontal"
+  )+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "right", title.hjust = 0.5))
+
+## BrainNet Viewer files
+# LME
+p <- Pval_Group[,1] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Group[,1] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Group_LME.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# LMEslp
+p <- Pval_Group[,2] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Group[,2] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Group_LMEslp.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# ComBat
+p <- Pval_Group[,3] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Group[,3] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Group_ComBat.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+
+# ComBat-GAM
+p <- Pval_Group[,4] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Group[,4] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Group_ComBat-GAM.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+```
+
+# Plot Age effect
+### Fig. 5A,B&C
+```{r,echo=FALSE}
+dfp <- cbind(Coef_Age,Pval_Age) # new dataframe for plot purpose
+dfp <- dfp[order(dfp[,4]),] # sort the values according to the coef. of ComBat-GAM (ascending order)
+Region <- rep(1:148,times=4)
+Coefficient <- dfp[,1:4] %>% as.matrix() %>% as.vector()
+P_value <- dfp[,6:9] %>% as.matrix() %>% as.vector() 
+Method <- rep(c('LME (int)','LME (int+slp)','ComBat','ComBat-GAM'),each=148)
+plt1 <- data.frame(Region,Coefficient,Method) %>% ggplot(aes(x=Region,y=Coefficient,col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip()
+plt2 <- data.frame(Region,P_value,Method) %>% ggplot(aes(x=Region,y=-1*log10(P_value),col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip() +ylab('-log10(p-value)') + geom_hline(yintercept=-1*log10(0.05),linetype="dashed", size=1) + geom_hline(yintercept=-1*log10(0.05/148),linetype="solid", size=1)
+ggarrange(plt2,plt1, labels=c("A","C"),legend='top',common.legend=T) # multiple plots
+
+## print significant results 
+print(dfp[dfp[,9]<0.05/148,c(4,6,7,8,9)]*148) # ComBat-GAM, 148 regions significant
+print(dfp[dfp[,8]<0.05/148,c(3,6,7,8,9)]*148) # ComBat, 148 regions significant
+print(dfp[dfp[,7]<0.05/148,c(2,6,7,8,9)]*148) # LME(int+slp), 78 regions significant
+print(dfp[dfp[,6]<0.05/148,c(1,6,7,8,9)]*148) # LME(int), 145 regions significant
+
+
+c(148, 148-148, 148, 148-148, 145, 148-145, 78, 148-78) %>% matrix(nrow=2, ncol=4, dimnames=list(c("Sig","NoSig"), c("ComBat-GAM","ComBat","LME(int)","LME(int+slp)"))) %>%  chisq.test()
+
+
+## heatmap of the proportion of regions detected by method#A are also detected by method#B
+mat <- matrix(0,4,4,dimnames=list(c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM"), c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM"))) # make a zero matrix of 4 rows and 4 columns
+for (i in c(1,2,3,4)){
+  for (j in c(1,2,3,4)){
+    # total number of significant regions
+    n_total <- dfp %>% .[.[,i+5]<0.05/148,] %>% dim() %>% .[1] 
+    # number of both significant regions
+    n_both  <- dfp %>% .[.[,i+5]<0.05/148 & .[,j+5]<0.05/148,] %>% dim() %>% .[1]
+    # proportion of regions detected by method#i that are also detected by method#j
+    mat[i,j] <- n_both/n_total*100 %>% round(digits=1)
+  }
+}
+# heatmap
+mat %>% melt() %>% ggplot(aes(Var2, Var1, fill = value))+ geom_tile(color = "white")+ scale_fill_gradient2(low="blue", mid="white", high="red", midpoint=50, limit =c(0,100), name="%") +theme_minimal()+ theme(axis.text.x=element_text(angle = 45, vjust = 1, size = 12, hjust = 1))+coord_fixed()+ 
+geom_text(aes(Var2, Var1, label=round(value,1)), color = "black", size = 4) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = "top",
+  legend.direction = "horizontal"
+  )+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "right", title.hjust = 0.5))
+
+## BrainNet Viewer files
+# LME
+p <- Pval_Age[,1] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Age[,1] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Age_LME.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# LMEslp
+p <- Pval_Age[,2] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Age[,2] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Age_LMEslp.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# ComBat
+p <- Pval_Age[,3] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Age[,3] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Age_ComBat.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+
+# ComBat-GAM
+p <- Pval_Age[,4] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Age[,4] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Age_ComBat-GAM.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+```
+
+# Plot Sex effect
+### Fig. 7A,B&C
+```{r,echo=FALSE}
+dfp <- cbind(Coef_Sex,Pval_Sex) # new dataframe for plot purpose
+dfp <- dfp[order(dfp[,4]),] # sort the values according to the coef. of ComBat-GAM (ascending order)
+Region <- rep(1:148,times=4)
+Coefficient <- dfp[,1:4] %>% as.matrix() %>% as.vector()
+P_value <- dfp[,6:9] %>% as.matrix() %>% as.vector() 
+Method <- rep(c('LME (int)','LME (int+slp)','ComBat','ComBat-GAM'),each=148)
+plt1 <- data.frame(Region,Coefficient,Method) %>% ggplot(aes(x=Region,y=Coefficient,col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip()
+plt2 <- data.frame(Region,P_value,Method) %>% ggplot(aes(x=Region,y=-1*log10(P_value),col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip() +ylab('-log10(p-value)') + geom_hline(yintercept=-1*log10(0.05),linetype="dashed", size=1) + geom_hline(yintercept=-1*log10(0.05/148),linetype="solid", size=1)
+ggarrange(plt2,plt1, labels=c("A","C"),legend='top',common.legend=T) # multiple plots
+
+## print significant results 
+print(dfp[dfp[,9]<0.05/148,c(4,6,7,8,9)]*148) # ComBat-GAM, 38 regions significant
+print(dfp[dfp[,8]<0.05/148,c(3,6,7,8,9)]*148) # ComBat, 38 regions significant
+print(dfp[dfp[,7]<0.05/148,c(2,6,7,8,9)]*148) # LME(int+slp), 28 regions significant
+print(dfp[dfp[,6]<0.05/148,c(1,6,7,8,9)]*148) # LME(int), 32 regions significant
+
+# chisq test of the number of significant regions
+c(38, 148-38, 38, 148-38, 32, 148-32, 28, 148-28) %>% matrix(nrow=2, ncol=4, dimnames=list(c("Sig","NoSig"), c("ComBat-GAM","ComBat","LME(int)","LME(int+slp)"))) %>%  chisq.test()
+
+## heatmap of the proportion of regions detected by method#A are also detected by method#B
+mat <- matrix(0,4,4,dimnames=list(c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM"), c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM"))) # make a zero matrix of 4 rows and 4 columns
+for (i in c(1,2,3,4)){
+  for (j in c(1,2,3,4)){
+    # total number of significant regions
+    n_total <- dfp %>% .[.[,i+5]<0.05/148,] %>% dim() %>% .[1] 
+    # number of both significant regions
+    n_both  <- dfp %>% .[.[,i+5]<0.05/148 & .[,j+5]<0.05/148,] %>% dim() %>% .[1]
+    # proportion of regions detected by method#i that are also detected by method#j
+    mat[i,j] <- n_both/n_total*100 %>% round(digits=1)
+  }
+}
+# heatmap
+mat %>% melt() %>% ggplot(aes(Var2, Var1, fill = value))+ geom_tile(color = "white")+ scale_fill_gradient2(low="blue", mid="white", high="red", midpoint=50, limit =c(0,100), name="%") +theme_minimal()+ theme(axis.text.x=element_text(angle = 45, vjust = 1, size = 12, hjust = 1))+coord_fixed()+ 
+geom_text(aes(Var2, Var1, label=round(value,1)), color = "black", size = 4) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = "top",
+  legend.direction = "horizontal"
+  )+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "right", title.hjust = 0.5))
+
+## BrainNet Viewer files
+# LME
+p <- Pval_Sex[,1] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Sex[,1] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Sex_LME.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# LMEslp
+p <- Pval_Sex[,2] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Sex[,2] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Sex_LMEslp.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# ComBat
+p <- Pval_Sex[,3] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Sex[,3] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Sex_ComBat.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+
+# ComBat-GAM
+p <- Pval_Sex[,4] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_Sex[,4] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_Sex_ComBat-GAM.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+```
+
+
+
+### (4.4.1a) Model: Group * Age + Gender, plotting coefficients & p-values
+```{r,echo=FALSE,warning=FALSE}
+# No Harmonized
+df <- df0
+df[df$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df[,2:149] %>% sapply(SDL_lm, df=df, Otype="model", ftxt="lmer(formula = y ~ Group * Age + Gender + (1 |Site))")
+Pval1a <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef1a <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+Modelx <- df[,2:149] %>% sapply(SDL_lm, df=df, Otype="model", ftxt="lmer(formula = y ~ Group * Age + Gender + (1+Age | SITE), control=lmerControl(optimizer='bobyqa'))")
+Pval1b <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef1b <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat
+df1[df1$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df1[,2:149] %>% sapply(SDL_lm, df=df1, Otype="model", ftxt="lm(formula = y ~ Group * Age + Gender)")
+Pval2 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef2 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat-GAM
+df2[df2$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df2[,2:149] %>% sapply(SDL_lm, df=df2, Otype="model", ftxt="lm(formula = y ~ Group * Age + Gender)")
+Pval3 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef3 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat++
+df3[df3$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df3[,2:149] %>% sapply(SDL_lm, df=df3, Otype="model", ftxt="lm(formula = y ~ Group * Age + Gender)")
+Pval4 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef4 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# effects of Group:Age
+Coef_GroupAge <- cbind(Coef1a[,5],Coef1b[,5],Coef2[,5],Coef3[,5],Coef4[,5]) %>% as.data.frame(row.names = rownames(Pval1a))
+colnames(Coef_GroupAge) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+Pval_GroupAge <- cbind(Pval1a[,5],Pval1b[,5],Pval2[,5],Pval3[,5],Pval4[,5])
+colnames(Pval_GroupAge) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+```
+
+
+# Plot Group by Age effect
+### Fig. 6A,B&D
+```{r,echo=FALSE}
+
+# Plot Group:Age Interaction
+dfp <- cbind(Coef_GroupAge,Pval_GroupAge) # new dataframe for plot purpose
+dfp <- dfp[order(dfp[,4]),] # sort the values according to the coef. of ComBat-GAM (ascending order)
+Region <- rep(1:148,times=4)
+Coefficient <- dfp[,1:4] %>% as.matrix() %>% as.vector()
+P_value <- dfp[,6:9] %>% as.matrix() %>% as.vector() 
+Method <- rep(c('LME (int)','LME (int+slp)','ComBat','ComBat-GAM'),each=148)
+plt1 <- data.frame(Region,Coefficient,Method) %>% ggplot(aes(x=Region,y=Coefficient,col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip()
+plt2 <- data.frame(Region,P_value,Method) %>% ggplot(aes(x=Region,y=-1*log10(P_value),col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip() +ylab('-log10(p-value)') + geom_hline(yintercept=-1*log10(0.05),linetype="dashed", size=1) + geom_hline(yintercept=-1*log10(0.05/148),linetype="solid", size=1)
+ggarrange(plt2,plt1, labels=c("A","C"),legend='top',common.legend=T) # multiple plots
+
+## print significant results 
+print(dfp[dfp[,9]<0.05/148,c(4,9)]) # ComBat-GAM, 5 regions significant
+print(dfp[dfp[,8]<0.05/148,c(3,8,9)]) # ComBat, 0 regions significant
+print(dfp[dfp[,6]<0.05/148,c(1,6,9)]) # LME(int), 0 regions significant
+print(dfp[dfp[,7]<0.05/148,c(2,7,9)]) # LME(int), 0 regions significant
+
+c(5, 148-5, 0, 148-0, 0, 148-0, 0, 148-0) %>% matrix(nrow=2, ncol=4, dimnames=list(c("Sig","NoSig"), c("ComBat-GAM","ComBat","LME(int)","LME(int+slp)"))) %>%  chisq.test()
+
+## heatmap of the proportion of regions detected by method#A are also detected by method#B
+mat <- matrix(0,4,4,dimnames=list(c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM"), c("LME(int)","LME(int+slp)","ComBat","ComBat-GAM"))) # make a zero matrix of 4 rows and 4 columns
+for (i in c(1,2,3,4)){
+  for (j in c(1,2,3,4)){
+    # total number of significant regions
+    n_total <- dfp %>% .[.[,i+5]<0.05/148,] %>% dim() %>% .[1] 
+    # number of both significant regions
+    n_both  <- dfp %>% .[.[,i+5]<0.05/148 & .[,j+5]<0.05/148,] %>% dim() %>% .[1]
+    # proportion of regions detected by method#i that are also detected by method#j
+    mat[i,j] <- n_both/n_total*100 %>% round(digits=1)
+  }
+}
+# heatmap
+mat %>% melt() %>% ggplot(aes(Var2, Var1, fill = value))+ geom_tile(color = "white")+ scale_fill_gradient2(low="blue", mid="white", high="red", midpoint=50, limit =c(0,100), name="%") +theme_minimal()+ theme(axis.text.x=element_text(angle = 45, vjust = 1, size = 12, hjust = 1))+coord_fixed()+ 
+geom_text(aes(Var2, Var1, label=round(value,1)), color = "black", size = 4) +
+theme(
+  axis.title.x = element_blank(),
+  axis.title.y = element_blank(),
+  panel.grid.major = element_blank(),
+  panel.border = element_blank(),
+  panel.background = element_blank(),
+  axis.ticks = element_blank(),
+  legend.justification = c(1, 0),
+  legend.position = "top",
+  legend.direction = "horizontal"
+  )+
+  guides(fill = guide_colorbar(barwidth = 7, barheight = 1,
+                title.position = "right", title.hjust = 0.5))
+
+## BrainNet Viewer files
+# LME
+p <- Pval_GroupAge[,1] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_GroupAge[,1] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupAge_LME.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# LMEslp
+p <- Pval_GroupAge[,2] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_GroupAge[,2] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupAge_LMEslp.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# ComBat
+p <- Pval_GroupAge[,3] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_GroupAge[,3] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupAge_ComBat.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+
+# ComBat-GAM
+p <- Pval_GroupAge[,4] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_GroupAge[,4] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupAge_ComBat-GAM.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+
+```
+
+### Fig. 6c
+```{r, echo=FALSE}
+# Age by Group interaction
+Coef_GroupAge[,1:4] %>% SDL_heatmap_coef()
+```
+
+
+
+
+### (4.4.1b) Model: Group * Gender + Age, plotting coefficients & p-values
+```{r,echo=FALSE,warning=FALSE}
+# No Harmonized
+df <- df0
+df[df$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df[,2:149] %>% sapply(SDL_lm, df=df, Otype="model", ftxt="lmer(formula = y ~ Group * Gender + Age + (1 |Site))")
+Pval1a <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef1a <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+Modelx <- df[,2:149] %>% sapply(SDL_lm, df=df, Otype="model", ftxt="lmer(formula = y ~ Group * Gender + Age + (1+Age | SITE), control=lmerControl(optimizer='bobyqa'))")
+Pval1b <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef1b <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat
+df1[df1$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df1[,2:149] %>% sapply(SDL_lm, df=df1, Otype="model", ftxt="lm(formula = y ~ Group * Gender + Age)")
+Pval2 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef2 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat-GAM
+df2[df2$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df2[,2:149] %>% sapply(SDL_lm, df=df2, Otype="model", ftxt="lm(formula = y ~ Group * Gender + Age)")
+Pval3 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef3 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# ComBat++
+df3[df3$Group==2,'Group'] = 0 # for the ease of linear model, PTSD=1, Control=0
+Modelx <- df3[,2:149] %>% sapply(SDL_lm, df=df3, Otype="model", ftxt="lm(formula = y ~ Group * Gender + Age)")
+Pval4 <- Modelx %>% sapply(SDL_cp, para="Pr(>|t|)") %>% t() %>% as.data.frame() # p values
+Coef4 <- Modelx %>% sapply(SDL_cp, para="Estimate") %>% t() %>% as.data.frame() # estimates
+
+# effects of Group:Sex
+Coef_GroupSex <- cbind(Coef1a[,5],Coef1b[,5],Coef2[,5],Coef3[,5],Coef4[,5]) %>% as.data.frame(row.names = rownames(Pval1a))
+colnames(Coef_GroupSex) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+Pval_GroupSex <- cbind(Pval1a[,5],Pval1b[,5],Pval2[,5],Pval3[,5],Pval4[,5])
+colnames(Pval_GroupSex) <- c('LME','LME+Slope','ComBat','ComBat-GAM','ComBat++')
+```
+
+# Plot Group:Sex Interacton
+### Fig. 8A,B&D
+```{r,echo=FALSE}
+dfp <- cbind(Coef_GroupSex,Pval_GroupSex) # new dataframe for plot purpose
+dfp <- dfp[order(dfp[,4]),] # sort the values according to the coef. of ComBat-GAM (ascending order)
+Region <- rep(1:148,times=4)
+Coefficient <- dfp[,1:4] %>% as.matrix() %>% as.vector()
+P_value <- dfp[,6:9] %>% as.matrix() %>% as.vector() 
+Method <- rep(c('LME (int)','LME (int+slp)','ComBat','ComBat-GAM'),each=148)
+plt1 <- data.frame(Region,Coefficient,Method) %>% ggplot(aes(x=Region,y=Coefficient,col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip()
+plt2 <- data.frame(Region,P_value,Method) %>% ggplot(aes(x=Region,y=-1*log10(P_value),col=Method)) + geom_point(alpha = 0.7) + geom_smooth(method = "loess", alpha = 0.05, size = 1, span = 1) + theme_bw() + theme(legend.position = "right") + scale_color_npg() + scale_x_reverse() + coord_flip() +ylab('-log10(p-value)') + geom_hline(yintercept=-1*log10(0.05),linetype="dashed", size=1) + geom_hline(yintercept=-1*log10(0.05/148),linetype="solid", size=1)
+ggarrange(plt2,plt1, labels=c("A","C"),legend='top',common.legend=T) # multiple plots
+
+## print significant results 
+print(dfp[dfp[,9]<0.05/148,c(4,9)]) # ComBat-GAM, 0 regions significant
+print(dfp[dfp[,8]<0.05/148,c(3,8,9)]) # ComBat, 0 regions significant
+print(dfp[dfp[,6]<0.05/148,c(1,6,9)]) # LME(int), 0 regions significant
+print(dfp[dfp[,7]<0.05/148,c(2,7,9)]) # LME(int), 0 regions significant
+
+c(0, 148-0, 0, 148-0, 0, 148-0, 0, 148-0) %>% matrix(nrow=2, ncol=4, dimnames=list(c("Sig","NoSig"), c("ComBat-GAM","ComBat","LME(int)","LME(int+slp)"))) %>%  chisq.test()
+
+## BrainNet Viewer files
+p <- Pval_GroupSex[,4] %>% log10()*(-1)
+cof <- Coef_GroupSex[,4]
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0)
+p_size  <- Coef_GroupSex[,4]
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupSex.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+
+# LME
+p <- Pval_GroupSex[,1] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_GroupSex[,1] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupSex_LME.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# LMEslp
+p <- Pval_GroupSex[,2] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_GroupSex[,2] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupSex_LMEslp.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F)
+
+# ComBat
+p <- Pval_GroupSex[,3] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_GroupSex[,3] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupSex_ComBat.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+
+# ComBat-GAM
+p <- Pval_GroupSex[,4] %>% log10()*(-1)
+p_color <- ifelse(p>-1*log10(0.05/148), 1, 0) # 1=display, 0=hide
+p_size  <- Coef_GroupSex[,4] # values to be plotted
+nf <- cbind(atlas[,2:4],p_color,p_size,atlas[,5]) 
+write.table(nf, "node_GroupSex_ComBat-GAM.txt", append = FALSE, sep = " ", dec = ".", row.names = F, col.names = F) 
+
+```
+
+### Fig. 8c
+```{r, echo=FALSE}
+# Age by Group interaction
+Coef_GroupSex[,1:4] %>% SDL_heatmap_coef()
+```
+
